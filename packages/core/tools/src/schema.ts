@@ -2,9 +2,9 @@
 
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { JsonValue } from '@deepseek-ai/dsh-session'
+import { isJsonValue, type JsonValue } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult, ToolRunContext, ToolResult } from './index.ts'
-import { assertSupportedJsonSchema, isJsonSchemaRecord, isPlainJsonArray, JsonSchemaError, validateJsonSchemaValue } from './json-schema.ts'
+import { assertSupportedJsonSchema, isJsonSchemaRecord, isPlainJsonArray, isPlainJsonRecord, JsonSchemaError, validateJsonSchemaValue } from './json-schema.ts'
 import type { JsonSchemaNode, JsonSchemaScalar, ObjectJsonSchema } from './json-schema.ts'
 import type { ToolCallView, ToolResultView } from './presentation.ts'
 
@@ -469,6 +469,119 @@ export class ToolArgsError extends HarnessError {
   }
 }
 
+/** Maximum recursion depth for unwrapping model-stringified argument values. */
+const COERCE_DEPTH_CAP = 24
+
+/**
+ * Strictly parse one JSON text that encodes exactly one lossless JSON value.
+ *
+ * `JSON.parse` refuses trailing garbage itself; non-finite and negative-zero
+ * results (which it can still produce from exponent or `-0` spellings) are
+ * refused by the lossless JSON boundary, so the strict validator rejects them
+ * exactly as it did before coercion existed.
+ *
+ * @param text - candidate JSON text.
+ * @returns The parsed lossless JSON value, or `undefined` when the text does
+ *   not encode exactly one lossless JSON value.
+ */
+function parseExactJsonValue(text: string): JsonValue | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return isJsonValue(parsed) ? parsed as JsonValue : undefined
+  } catch {
+    // `JSON.parse` throws on trailing garbage (for example `{"a":1} x`); treat
+    // such text as not-a-JSON-value so the caller keeps the raw string.
+    return undefined
+  }
+}
+
+/**
+ * Coerce model-generated arguments before strict validation.
+ *
+ * GLM-5.3-Flash (and other Z.ai/GLM routes) serialize tool-call argument
+ * values as JSON strings even when the declared parameter type is array,
+ * object, number, integer, or boolean — streaming `{"queries":
+ * "[\"OpenAI latest news\"]"}` instead of a real array, so a strict validator
+ * fails every such call with `invalid arguments: "queries" must be an array`.
+ *
+ * Coercion here is type-directed and additive, never a general leniency:
+ * `string`-typed parameters stay verbatim (so a `bash` command or `write`
+ * content that merely *looks* like JSON is never corrupted), only a string
+ * whose exact JSON parse is the declared type is unwrapped, recursion into
+ * array items and object properties is depth-bounded, and the strict
+ * validator runs on the coerced value afterwards, so genuinely malformed
+ * input fails with the same diagnostics as before.
+ *
+ * @param args - candidate arguments, however malformed.
+ * @param schema - the compiled parameter object schema.
+ * @returns The coerced arguments tree.
+ */
+export function coerceModelArgs(args: unknown, schema: ParameterJsonSchema): unknown {
+  if (!isJsonSchemaRecord(schema)) return args
+  return coerceValueAt(schema, args, 0)
+}
+
+/** Recursive scalar/array/object unwrap over one compiled schema node. */
+function coerceValueAt(node: Record<string, unknown>, value: unknown, depth: number): unknown {
+  if (depth > COERCE_DEPTH_CAP) return value
+  const type = Object.hasOwn(node, 'type') ? node.type : undefined
+  if (typeof type !== 'string') return value
+  switch (type) {
+    case 'array': {
+      const unwrapped = typeof value === 'string' && value.length > 0 ? parseExactJsonValue(value) : undefined
+      const candidate = isPlainJsonArray(unwrapped) ? unwrapped : value
+      if (!isPlainJsonArray(candidate)) return value
+      const items = Object.hasOwn(node, 'items') ? node.items : undefined
+      if (!isJsonSchemaRecord(items)) return candidate
+      return candidate.map(entry => coerceValueAt(items, entry, depth + 1))
+    }
+    case 'object': {
+      const properties = Object.hasOwn(node, 'properties') ? node.properties : undefined
+      if (isPlainJsonRecord(value)) {
+        const coerced: Record<string, unknown> = { ...value }
+        if (isJsonSchemaRecord(properties)) {
+          for (const [key, child] of Object.entries(properties)) {
+            if (!Object.hasOwn(value, key)) continue
+            if (!isJsonSchemaRecord(child)) continue
+            coerced[key] = coerceValueAt(child, value[key], depth + 1)
+          }
+        }
+        return coerced
+      }
+      const unwrapped = typeof value === 'string' && value.length > 0 ? parseExactJsonValue(value) : undefined
+      const candidate = isPlainJsonRecord(unwrapped) ? unwrapped : value
+      if (!isPlainJsonRecord(candidate)) return value
+      const coerced: Record<string, unknown> = { ...candidate }
+      if (isJsonSchemaRecord(properties)) {
+        for (const [key, child] of Object.entries(properties)) {
+          if (!Object.hasOwn(candidate, key)) continue
+          if (!isJsonSchemaRecord(child)) continue
+          coerced[key] = coerceValueAt(child, candidate[key], depth + 1)
+        }
+      }
+      return coerced
+    }
+    case 'number': {
+      const parsed = typeof value === 'string' && value.length > 0 ? parseExactJsonValue(value) : undefined
+      const candidate = typeof parsed === 'number' ? parsed : value
+      if (typeof candidate !== 'number' || !Number.isFinite(candidate)) return value
+      return candidate === 0 ? 0 : candidate
+    }
+    case 'integer': {
+      const parsed = typeof value === 'string' && value.length > 0 ? parseExactJsonValue(value) : undefined
+      const candidate = typeof parsed === 'number' && Number.isInteger(parsed) ? parsed : value
+      if (typeof candidate !== 'number' || !Number.isInteger(candidate)) return value
+      return candidate === 0 ? 0 : candidate
+    }
+    case 'boolean': {
+      const parsed = typeof value === 'string' && value.length > 0 ? parseExactJsonValue(value) : undefined
+      return typeof parsed === 'boolean' ? parsed : value
+    }
+    default:
+      return value
+  }
+}
+
 /**
  * Validate model-generated arguments against an implicit parameter schema.
  * @param spec - declared parameter schema.
@@ -476,7 +589,8 @@ export class ToolArgsError extends HarnessError {
  * @returns Path-qualified violations; empty means valid.
  */
 export function validateArgs(spec: ParameterSchemaSpec, args: unknown): string[] {
-  return validateJsonSchemaValue(parameterSchemaSpecToJsonSchema(spec), args, '')
+  const schema = parameterSchemaSpecToJsonSchema(spec)
+  return validateJsonSchemaValue(schema, coerceModelArgs(args, schema), '')
 }
 
 /** Options for {@link defineTool}. */
@@ -538,7 +652,10 @@ export interface DefineToolOptions<S extends ParameterSchemaSpec, O extends Valu
 /**
  * Define a first-party tool with inferred arguments and strict execution
  * validation. Replay-only presenters validate softly and fall back to generic
- * rendering for obsolete logged arguments.
+ * rendering for obsolete logged arguments. Model-side JSON-stringified
+ * argument values are unwrapped once at this boundary (see
+ * {@link coerceModelArgs}); strict validation still runs on the coerced
+ * arguments.
  * @param options - typed definition and optional finalizer and presenters.
  * @returns A registry-ready definition.
  */
@@ -565,7 +682,8 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   }
   const parameters = parameterSchemaSpecToJsonSchema(options.parameters)
   const outputSchema = valueSchemaSpecToJsonSchema(options.output.schema)
-  const validate = (args: unknown): string[] => validateJsonSchemaValue(parameters, args, '')
+  const normalize = (args: unknown): unknown => coerceModelArgs(args, parameters)
+  const validate = (args: unknown): string[] => validateJsonSchemaValue(parameters, normalize(args), '')
   const tool: ToolDefinition = {
     name: options.name,
     description: options.description,
@@ -583,9 +701,10 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
     },
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     async execute(args: unknown, exec: ToolRunContext): Promise<JsonValue> {
-      const violations = validate(args)
+      const coerced = normalize(args)
+      const violations = validateJsonSchemaValue(parameters, coerced, '')
       if (violations.length > 0) throw new ToolArgsError(violations)
-      return userExecute(args as InferArgs<S>, exec) as Promise<JsonValue>
+      return userExecute(coerced as InferArgs<S>, exec) as Promise<JsonValue>
     },
   }
   if (userFinalizeContent) {
@@ -597,20 +716,23 @@ export function defineTool<const S extends ParameterSchemaSpec, const O extends 
   // than the hard `ToolArgsError` the execute path raises.
   if (userPresentCall) {
     tool.presentCall = (args: unknown): ToolCallView | undefined => {
-      if (validate(args).length > 0) return undefined
-      return userPresentCall(args as InferArgs<S>)
+      const coerced = normalize(args)
+      if (validate(coerced).length > 0) return undefined
+      return userPresentCall(coerced as InferArgs<S>)
     }
   }
   if (userPresentResult) {
     tool.presentResult = (args: unknown, result: ToolResult): ToolResultView | undefined => {
-      if (validate(args).length > 0) return undefined
-      return userPresentResult(args as InferArgs<S>, result)
+      const coerced = normalize(args)
+      if (validate(coerced).length > 0) return undefined
+      return userPresentResult(coerced as InferArgs<S>, result)
     }
   }
   if (userIsConcurrencySafe) {
     tool.isConcurrencySafe = (args: unknown): boolean => {
-      if (validate(args).length > 0) return false
-      return userIsConcurrencySafe(args as InferArgs<S>)
+      const coerced = normalize(args)
+      if (validate(coerced).length > 0) return false
+      return userIsConcurrencySafe(coerced as InferArgs<S>)
     }
   }
   return tool

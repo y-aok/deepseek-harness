@@ -2566,6 +2566,62 @@ describe('validateArgs (the runtime-validation Agent Note, part 1)', () => {
   })
 })
 
+describe('coerceModelArgs (model-side JSON-stringified argument values)', () => {
+  it('unwraps a stringified array/number/boolean to its declared type and leaves strings verbatim', () => {
+    const spec = {
+      queries: { type: 'array', items: { type: 'string' } },
+      limit: { type: 'integer' },
+      enabled: { type: 'boolean' },
+      path: { type: 'string', required: true },
+    } satisfies ParameterSchemaSpec
+    expect(validateArgs(spec, { path: '/tmp', queries: '["OpenAI latest news"]', limit: '5', enabled: 'true' })).toEqual([])
+    // a string-typed parameter whose content merely looks like JSON stays verbatim
+    expect(validateArgs(spec, { path: '["x"]' })).toEqual([])
+  })
+
+  it('keeps genuinely malformed values failing with the same diagnostics', () => {
+    const spec = {
+      queries: { type: 'array' },
+      limit: { type: 'integer' },
+      enabled: { type: 'boolean' },
+    } satisfies ParameterSchemaSpec
+    expect(validateArgs(spec, { queries: '"[\\"x\"]"' })).toEqual(['"queries" must be an array'])
+    expect(validateArgs(spec, { queries: '["x"] trailing' })).toEqual(['"queries" must be an array'])
+    expect(validateArgs(spec, { limit: '"5"' })).toEqual(['"limit" must be an integer'])
+    expect(validateArgs(spec, { limit: '5.5' })).toEqual(['"limit" must be an integer'])
+    expect(validateArgs(spec, { enabled: '"true"' })).toEqual(['"enabled" must be a boolean'])
+    expect(validateArgs(spec, { enabled: 'yes' })).toEqual(['"enabled" must be a boolean'])
+  })
+
+  it('recurses coercion into array items and object properties', () => {
+    const spec = {
+      servers: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { port: { type: 'integer' } } } },
+      config: { type: 'object', additionalProperties: true, properties: { port: { type: 'integer' } } },
+    } satisfies ParameterSchemaSpec
+    expect(validateArgs(spec, { servers: '[{"port":"9"}]', config: '{"port":"9"}' })).toEqual([])
+    expect(validateArgs(spec, { config: { port: '9' } })).toEqual([])
+    expect(validateArgs(spec, { config: { port: 'nine' } })).toEqual(['"config.port" must be an integer'])
+  })
+
+  it('hands the unwrapped arguments to the tool body at execute time', async () => {
+    const ctx = await setup()
+    let seenValue: unknown = undefined
+    ctx.tools.register(defineContentToolFixture({
+      name: 'searcher',
+      description: 'records the queries it received',
+      parameters: { queries: { type: 'array', items: { type: 'string' } } },
+      async execute(args) {
+        seenValue = args.queries
+        return [{ type: 'text', text: String(args.queries?.length ?? 0) }]
+      },
+    }))
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('c1'), name: 'searcher', arguments: { queries: '["OpenAI latest news"]' } })
+    expect(result.isError).toBe(false)
+    expect(seenValue).toEqual(['OpenAI latest news'])
+    expect(result.content[0]).toMatchObject({ text: '1' })
+  })
+})
+
 describe('defineTool validation (the runtime-validation Agent Note, part 1)', () => {
   it('returns an isError result with the violations when the model sends bad args', async () => {
     const ctx = await setup()
